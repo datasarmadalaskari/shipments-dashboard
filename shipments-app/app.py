@@ -155,6 +155,10 @@ def _sheet(xls, name_part):
     return next(s for s in xls.sheet_names if name_part.lower() in s.lower())
 
 
+SHIP_COLUMNS = ["Status", "Cars", "Booking #", "Model", "Destination", "Shipping line",
+                "Sail date", "ETA", "Supplier", "Consignee", "Contract", "Year"]
+
+
 def read_sheet(xls, name_part, line_cols):
     name = _sheet(xls, name_part)
     df = pd.read_excel(xls, sheet_name=name, header=0)
@@ -183,7 +187,7 @@ def read_sheet(xls, name_part, line_cols):
             "Contract": txt(r.get("CHINA Contract")),
             "Year": "No date" if pd.isna(when) else str(when.year),
         })
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows, columns=SHIP_COLUMNS)
 
 
 def read_f550_vins(xls):
@@ -298,13 +302,16 @@ tab_china, tab_f550 = st.tabs(["China Shipments", "F-550 Shipments"])
 def drill_down(key: str, table: pd.DataFrame, raw: pd.DataFrame, vins_full=None):
     """Pick one booking: its shipment lines, every sheet column, and (China) its VINs."""
     st.subheader("Open a shipment")
-    if table["Contract"].str.strip().ne("").any():
-        tokens = sorted({t.strip() for c in table["Contract"] for t in c.split("&")
+    if "Contract" not in table.columns:
+        table = table.assign(Contract="")
+    contract_col = table["Contract"].fillna("").astype(str)
+    if contract_col.str.strip().ne("").any():
+        tokens = sorted({t.strip() for c in contract_col for t in c.split("&")
                          if t.strip() not in ("", "-") and "same booking" not in t.lower()})
         pick_contract = st.multiselect("China contract", tokens, key=f"{key}-contract",
                                        placeholder="All contracts")
         if pick_contract:
-            table = table[table["Contract"].map(
+            table = table[contract_col.map(
                 lambda c: any(t.strip() in pick_contract for t in c.split("&")))]
     opts = sorted(b for b in table["Booking #"].unique() if b)
     if not opts:
