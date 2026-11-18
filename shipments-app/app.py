@@ -185,6 +185,15 @@ def read_sheet(xls, name_part, line_cols):
     return pd.DataFrame(rows)
 
 
+def read_f550_vins(xls):
+    """F-550 VINs: one row per car; its booking is in the BK# column."""
+    df = pd.read_excel(xls, sheet_name=_sheet(xls, "F-550 VINs"))
+    df.columns = [str(c).strip() for c in df.columns]
+    df = df[df["VIN"].map(txt) != ""].copy()
+    df["Booking#"] = df["BK#"].map(txt)
+    return df.reset_index(drop=True)
+
+
 def read_vins(xls):
     """China VINs: one row per car, with its contract (Order) and booking number."""
     df = pd.read_excel(xls, sheet_name=_sheet(xls, "China VINs"))
@@ -230,10 +239,11 @@ def load_data(slot_key: str):
     china = read_sheet(xls, "China Shipments", ["Shipping Line.1", "Shipping Line"])
     f550 = read_sheet(xls, "F-550 Shipments", ["SL"])
     vins, vins_full = read_vins(xls)
+    f550_vins = read_f550_vins(xls)
     china_raw = pd.read_excel(xls, sheet_name=_sheet(xls, "China Shipments"))
     f550_raw = pd.read_excel(xls, sheet_name=_sheet(xls, "F-550 Shipments"))
     loaded_at = dt.datetime.now(TZ)
-    return china, f550, vins, vins_full, china_raw, f550_raw, modified, loaded_at
+    return china, f550, vins, vins_full, f550_vins, china_raw, f550_raw, modified, loaded_at
 
 
 # ---------------------------------------------------------------- styling
@@ -267,7 +277,7 @@ def nb(df):
 
 # ---------------------------------------------------------------- page
 slot = last_refresh_slot()
-china, f550, vins, vins_full, china_raw, f550_raw, modified, loaded_at = load_data(slot.isoformat())
+china, f550, vins, vins_full, f550_vins, china_raw, f550_raw, modified, loaded_at = load_data(slot.isoformat())
 
 t_col, b_col = st.columns([6, 1])
 with t_col:
@@ -305,7 +315,6 @@ def drill_down(key: str, table: pd.DataFrame, raw: pd.DataFrame, vins_full=None)
         st.dataframe(sheet_rows, hide_index=True, width="stretch")
 
     if vins_full is None:
-        st.info("F-550 VINs are not linked to a booking number yet, so they are not shown here.")
         return
     cars = (vins_full[vins_full["Booking#"].map(txt) == pick]
             .drop(columns=["Inventory", "SOLD YEAR"], errors="ignore")
@@ -466,6 +475,6 @@ def render_vins(v: pd.DataFrame):
 with tab_china:
     render(china, "china", china_raw, vins_full)
 with tab_f550:
-    render(f550, "f550", f550_raw, None)
+    render(f550, "f550", f550_raw, f550_vins)
 with tab_vins:
     render_vins(vins)
