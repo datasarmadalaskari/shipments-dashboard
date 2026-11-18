@@ -180,6 +180,7 @@ def read_sheet(xls, name_part, line_cols):
             "ETA": eta,
             "Supplier": txt(r.get("Supplier")).strip("- "),
             "Consignee": txt(r.get("Consignee - Tafweed")),
+            "Contract": txt(r.get("CHINA Contract")),
             "Year": "No date" if pd.isna(when) else str(when.year),
         })
     return pd.DataFrame(rows)
@@ -291,14 +292,23 @@ file_txt = f"{modified:%d/%m/%Y, %H:%M}" if modified else "not available"
 st.markdown(f'<p class="sub">File last updated: <b>{file_txt}</b> · '
             f'Loaded here: <b>{loaded_at:%d/%m/%Y, %H:%M}</b></p>', unsafe_allow_html=True)
 
-tab_china, tab_f550, tab_vins = st.tabs(["China Shipments", "F-550 Shipments", "China VINs"])
+tab_china, tab_f550 = st.tabs(["China Shipments", "F-550 Shipments"])
 
 
 def drill_down(key: str, table: pd.DataFrame, raw: pd.DataFrame, vins_full=None):
     """Pick one booking: its shipment lines, every sheet column, and (China) its VINs."""
     st.subheader("Open a shipment")
+    if table["Contract"].str.strip().ne("").any():
+        tokens = sorted({t.strip() for c in table["Contract"] for t in c.split("&")
+                         if t.strip() not in ("", "-") and "same booking" not in t.lower()})
+        pick_contract = st.multiselect("China contract", tokens, key=f"{key}-contract",
+                                       placeholder="All contracts")
+        if pick_contract:
+            table = table[table["Contract"].map(
+                lambda c: any(t.strip() in pick_contract for t in c.split("&")))]
     opts = sorted(b for b in table["Booking #"].unique() if b)
     if not opts:
+        st.info("No shipments match this contract.")
         return
     pick = st.selectbox("Booking #", opts, index=None, key=f"{key}-open",
                         placeholder="Pick a booking number to see its details and VINs")
@@ -383,7 +393,7 @@ def render(df: pd.DataFrame, key: str, raw: pd.DataFrame, vins_full=None):
     table = table.sort_values("Sail date", ascending=False, na_position="last")
     st.caption(f"{nb(table):,} booking numbers · {len(table):,} lines")
     st.dataframe(
-        table,
+        table.drop(columns=["Contract"], errors="ignore"),
         hide_index=True,
         width="stretch",
         height=520,
@@ -476,5 +486,3 @@ with tab_china:
     render(china, "china", china_raw, vins_full)
 with tab_f550:
     render(f550, "f550", f550_raw, f550_vins)
-with tab_vins:
-    render_vins(vins)
