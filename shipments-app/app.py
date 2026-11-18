@@ -3,6 +3,11 @@
 Reads the MASTER(NEW) workbook from Google Drive, and refreshes the data
 every Saturday and Wednesday (the first visit after each refresh time pulls
 the latest file).
+
+Tabs:
+  * China Shipments  (unchanged)
+  * F-550 Shipments  (unchanged)
+  * China VINs       (new: cars by China contract and booking number, VIN search)
 """
 
 import io
@@ -19,6 +24,7 @@ import streamlit as st
 TZ = ZoneInfo("Asia/Amman")
 REFRESH_DAYS = (2, 5)  # Wednesday=2, Saturday=5 (Monday=0)
 REFRESH_HOUR = 8       # 08:00 Amman time
+VINS_DEFAULT_YEAR = "2026"   # the VINs tab opens on the new cars of this year
 
 STATUS_ORDER = ["Loaded", "Delivered", "Other"]
 STATUS_COLORS = {"Loaded": "#3b82f6", "Delivered": "#16a34a", "Other": "#dc2626"}
@@ -137,8 +143,12 @@ def clean_dest(v):
     return s.split(",")[0].replace(" PORT", "").strip().title()
 
 
+def _sheet(xls, name_part):
+    return next(s for s in xls.sheet_names if name_part.lower() in s.lower())
+
+
 def read_sheet(xls, name_part, line_cols):
-    name = next(s for s in xls.sheet_names if name_part.lower() in s.lower())
+    name = _sheet(xls, name_part)
     df = pd.read_excel(xls, sheet_name=name, header=0)
     df.columns = [str(c).strip() for c in df.columns]
     rows = []
@@ -167,14 +177,51 @@ def read_sheet(xls, name_part, line_cols):
     return pd.DataFrame(rows)
 
 
+def read_vins(xls):
+    """China VINs: one row per car, with its contract (Order) and booking number."""
+    df = pd.read_excel(xls, sheet_name=_sheet(xls, "China VINs"))
+    df.columns = [str(c).strip() for c in df.columns]   # 'Order date' first occurrence = the order date
+    df = df[df["VIN"].map(txt) != ""]
+
+    contracts = pd.read_excel(xls, sheet_name=_sheet(xls, "China Contracts"))
+    known_col = next(c for c in contracts.columns if "china contract" in str(c).lower())
+    known = {txt(v) for v in contracts[known_col] if txt(v)}
+
+    order = df["Order"].map(txt)
+    date = pd.to_datetime(df["Order date"], errors="coerce")
+    out = pd.DataFrame({
+        "VIN": df["VIN"].map(txt).str.upper(),
+        "Model": df["Model, Exterior, Interior / Contract"].map(txt),
+        "Color": df["Color"].map(txt),
+        "Contract": order,
+        "Contract matched": order.isin(known).map({True: "Yes", False: "No"}),
+        "Booking #": df["Booking#"].map(txt),
+        "Status": df["Status"].map(txt),
+        "Order date": date,
+    })
+    # Year: from the contract code (e.g. JFEX-26-290F -> 2026), since most rows have no order date
+    code = order.str.extract(r"-(\d{2})-")[0]
+    from_code = code.map(lambda c: "" if pd.isna(c) else f"20{c}")
+    from_date = date.dt.year.map(lambda y: "" if pd.isna(y) else str(int(y)))
+    out["Year"] = from_code.where(from_code != "", from_date).replace("", "No date")
+
+    # a car can appear twice (cancelled line + real line): keep the real one
+    # and leave out cancelled / never-shipped lines
+    out = out[~out["Status"].str.contains("Cancelled|Not Shipped", case=False, regex=True)]
+    out = out.assign(_has_booking=out["Booking #"] != "")
+    out = out.sort_values("_has_booking", ascending=False).drop_duplicates("VIN")
+    return out.drop(columns="_has_booking").reset_index(drop=True)
+
+
 @st.cache_data(max_entries=2, show_spinner="Loading shipments…")
 def load_data(slot_key: str):
     raw = download_workbook()
     xls = pd.ExcelFile(io.BytesIO(raw))
     china = read_sheet(xls, "China Shipments", ["Shipping Line.1", "Shipping Line"])
     f550 = read_sheet(xls, "F-550 Shipments", ["SL"])
+    vins = read_vins(xls)
     loaded_at = dt.datetime.now(TZ)
-    return china, f550, loaded_at
+    return china, f550, vins, loaded_at
 
 
 # ---------------------------------------------------------------- styling
@@ -208,12 +255,12 @@ def nb(df):
 
 # ---------------------------------------------------------------- page
 slot = last_refresh_slot()
-china, f550, loaded_at = load_data(slot.isoformat())
+china, f550, vins, loaded_at = load_data(slot.isoformat())
 
 st.title("China & F-550 Shipments")
 st.markdown(f'<p class="sub">Last refresh: <b>{loaded_at:%d/%m/%Y, %H:%M}</b></p>', unsafe_allow_html=True)
 
-tab_china, tab_f550 = st.tabs(["China Shipments", "F-550 Shipments"])
+tab_china, tab_f550, tab_vins = st.tabs(["China Shipments", "F-550 Shipments", "China VINs"])
 
 
 def render(df: pd.DataFrame, key: str):
@@ -279,7 +326,81 @@ def render(df: pd.DataFrame, key: str):
     )
 
 
+def render_vins(v: pd.DataFrame):
+    if v.empty:
+        st.info("No cars found in the China VINs sheet.")
+        return
+
+    # filters
+    years = sorted([y for y in v["Year"].unique() if y != "No date"], reverse=True)
+    options = ["All years"] + years
+    default = options.index(VINS_DEFAULT_YEAR) if VINS_DEFAULT_YEAR in options else 0
+    f1, f2, f3 = st.columns([1, 2, 2])
+    year = f1.selectbox("Year (order date)", options, index=default, key="vins-year")
+    sub = v if year == "All years" else v[v["Year"] == year]
+
+    contracts = sorted(c for c in sub["Contract"].unique() if c)
+    pick_c = f2.multiselect("Contract", contracts, key="vins-contract", placeholder="All contracts")
+    bookings = sorted(b for b in sub["Booking #"].unique() if b)
+    pick_b = f3.multiselect("Booking #", bookings, key="vins-booking", placeholder="All bookings")
+    q = st.text_input("Search VIN", placeholder="Paste a VIN or part of it", key="vins-q")
+    only_unmatched = st.checkbox("Only cars without a matching China contract", key="vins-unmatched")
+
+    if pick_c:
+        sub = sub[sub["Contract"].isin(pick_c)]
+    if pick_b:
+        sub = sub[sub["Booking #"].isin(pick_b)]
+    if only_unmatched:
+        sub = sub[sub["Contract matched"] == "No"]
+    if q.strip():
+        sub = sub[sub["VIN"].str.contains(q.strip().upper(), regex=False)]
+    if sub.empty:
+        st.warning("No cars match these filters.")
+        return
+
+    k = st.columns(4)
+    kpi(k[0], len(sub), "Cars", "VINs", "#8a8f98")
+    kpi(k[1], sub["Contract"].nunique(), "Contracts", "China contracts", "#14b8a6")
+    kpi(k[2], sub["Booking #"].nunique(), "Bookings", "booking numbers", STATUS_COLORS["Loaded"])
+    kpi(k[3], int((sub["Contract matched"] == "No").sum()), "No matching contract", "cars",
+        STATUS_COLORS["Other"])
+
+    # by booking
+    st.subheader("By booking")
+    by_b = (sub.groupby(["Booking #", "Contract"], dropna=False)
+              .agg(Cars=("VIN", "count"), VINs=("VIN", lambda s: ", ".join(s)))
+              .reset_index()
+              .sort_values("Cars", ascending=False))
+    st.dataframe(
+        by_b,
+        hide_index=True,
+        width="stretch",
+        height=280,
+        column_config={
+            "Cars": st.column_config.NumberColumn(format="%d"),
+            "VINs": st.column_config.TextColumn(width="large"),
+        },
+    )
+
+    # every car
+    st.subheader("Cars")
+    cols = ["VIN", "Model", "Color", "Contract", "Contract matched", "Booking #", "Status", "Order date"]
+    st.dataframe(
+        sub[cols].sort_values("Order date", ascending=False, na_position="last"),
+        hide_index=True,
+        width="stretch",
+        height=420,
+        column_config={
+            "Order date": st.column_config.DateColumn(format="DD/MM/YYYY"),
+            "Contract matched": st.column_config.TextColumn("Matches a China contract"),
+        },
+    )
+    st.caption(f"{len(sub):,} car(s) with the filters above")
+
+
 with tab_china:
     render(china, "china")
 with tab_f550:
     render(f550, "f550")
+with tab_vins:
+    render_vins(vins)
