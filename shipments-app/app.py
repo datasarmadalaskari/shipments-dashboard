@@ -14,6 +14,7 @@ import io
 import os
 import re
 import datetime as dt
+from email.utils import parsedate_to_datetime
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -56,11 +57,13 @@ def last_refresh_slot(now=None):
 
 
 # ---------------------------------------------------------------- loading the workbook
-def download_workbook() -> bytes:
+def download_workbook():
+    """Returns (file bytes, when the file was last changed - or None if unknown)."""
     local = setting("LOCAL_PATH")
     if local:
         with open(local, "rb") as f:
-            return f.read()
+            data = f.read()
+        return data, dt.datetime.fromtimestamp(os.path.getmtime(local), TZ)
 
     file_id = setting("DRIVE_FILE_ID")
     if not file_id:
@@ -78,7 +81,9 @@ def download_workbook() -> bytes:
             scopes=["https://www.googleapis.com/auth/drive.readonly"],
         )
         drive = build("drive", "v3", credentials=creds, cache_discovery=False)
-        meta = drive.files().get(fileId=file_id, fields="mimeType", supportsAllDrives=True).execute()
+        meta = drive.files().get(fileId=file_id, fields="mimeType,modifiedTime",
+                                 supportsAllDrives=True).execute()
+        modified = dt.datetime.fromisoformat(meta["modifiedTime"].replace("Z", "+00:00")).astimezone(TZ)
         if meta["mimeType"] == "application/vnd.google-apps.spreadsheet":
             req = drive.files().export_media(
                 fileId=file_id,
@@ -91,7 +96,7 @@ def download_workbook() -> bytes:
         done = False
         while not done:
             _, done = dl.next_chunk()
-        return buf.getvalue()
+        return buf.getvalue(), modified
 
     # File shared as "Anyone with the link".
     urls = [
@@ -101,7 +106,10 @@ def download_workbook() -> bytes:
     for url in urls:
         r = requests.get(url, timeout=60)
         if r.ok and r.content[:2] == b"PK":  # an .xlsx is a zip file
-            return r.content
+            modified = None
+            if r.headers.get("Last-Modified"):
+                modified = parsedate_to_datetime(r.headers["Last-Modified"]).astimezone(TZ)
+            return r.content, modified
     st.error("Couldn't download the workbook. Check the file is shared and DRIVE_FILE_ID is right.")
     st.stop()
 
@@ -217,7 +225,7 @@ def read_vins(xls):
 
 @st.cache_data(max_entries=2, show_spinner="Loading shipments…")
 def load_data(slot_key: str):
-    raw = download_workbook()
+    raw, modified = download_workbook()
     xls = pd.ExcelFile(io.BytesIO(raw))
     china = read_sheet(xls, "China Shipments", ["Shipping Line.1", "Shipping Line"])
     f550 = read_sheet(xls, "F-550 Shipments", ["SL"])
@@ -225,7 +233,7 @@ def load_data(slot_key: str):
     china_raw = pd.read_excel(xls, sheet_name=_sheet(xls, "China Shipments"))
     f550_raw = pd.read_excel(xls, sheet_name=_sheet(xls, "F-550 Shipments"))
     loaded_at = dt.datetime.now(TZ)
-    return china, f550, vins, vins_full, china_raw, f550_raw, loaded_at
+    return china, f550, vins, vins_full, china_raw, f550_raw, modified, loaded_at
 
 
 # ---------------------------------------------------------------- styling
@@ -259,10 +267,19 @@ def nb(df):
 
 # ---------------------------------------------------------------- page
 slot = last_refresh_slot()
-china, f550, vins, vins_full, china_raw, f550_raw, loaded_at = load_data(slot.isoformat())
+china, f550, vins, vins_full, china_raw, f550_raw, modified, loaded_at = load_data(slot.isoformat())
 
-st.title("China & F-550 Shipments")
-st.markdown(f'<p class="sub">Last refresh: <b>{loaded_at:%d/%m/%Y, %H:%M}</b></p>', unsafe_allow_html=True)
+t_col, b_col = st.columns([6, 1])
+with t_col:
+    st.title("China & F-550 Shipments")
+with b_col:
+    st.write("")
+    if st.button("↻ Refresh", width="stretch", help="Read the latest file from Google Drive now"):
+        st.cache_data.clear()
+        st.rerun()
+file_txt = f"{modified:%d/%m/%Y, %H:%M}" if modified else "not available"
+st.markdown(f'<p class="sub">File last updated: <b>{file_txt}</b> · '
+            f'Loaded here: <b>{loaded_at:%d/%m/%Y, %H:%M}</b></p>', unsafe_allow_html=True)
 
 tab_china, tab_f550, tab_vins = st.tabs(["China Shipments", "F-550 Shipments", "China VINs"])
 
@@ -313,10 +330,16 @@ def render(df: pd.DataFrame, key: str, raw: pd.DataFrame, vins_full=None):
         year = st.selectbox("Year", options, index=default, key=f"{key}-year")
     with c1:
         status_pick = st.segmented_control(
-            "Show", ["All"] + STATUS_ORDER, default="All", key=f"{key}-status",
+            "Show", ["All"] + STATUS_ORDER, default="Loaded", key=f"{key}-status",
         ) or "All"
 
     view = df if year == "All years" else df[df["Year"] == year]
+    model_q = st.text_input("Car model", placeholder="e.g. Elantra, Tucson", key=f"{key}-model")
+    if model_q.strip():
+        view = view[view["Model"].str.contains(model_q.strip(), case=False, regex=False)]
+    if view.empty:
+        st.warning("No shipments match these filters.")
+        return
 
     # Headline figures (distinct booking numbers)
     cols = st.columns(5)
@@ -375,6 +398,9 @@ def render_vins(v: pd.DataFrame):
     f1, f2, f3 = st.columns([1, 2, 2])
     year = f1.selectbox("Year (order date)", options, index=default, key="vins-year")
     sub = v if year == "All years" else v[v["Year"] == year]
+    model_q = st.text_input("Car model", placeholder="e.g. Elantra, Tucson", key="vins-model")
+    if model_q.strip():
+        sub = sub[sub["Model"].str.contains(model_q.strip(), case=False, regex=False)]
 
     contracts = sorted(c for c in sub["Contract"].unique() if c)
     pick_c = f2.multiselect("Contract", contracts, key="vins-contract", placeholder="All contracts")
