@@ -307,7 +307,9 @@ def drill_down(key: str, table: pd.DataFrame, raw: pd.DataFrame, vins_full=None)
     if vins_full is None:
         st.info("F-550 VINs are not linked to a booking number yet, so they are not shown here.")
         return
-    cars = vins_full[vins_full["Booking#"].map(txt) == pick].dropna(axis=1, how="all")
+    cars = (vins_full[vins_full["Booking#"].map(txt) == pick]
+            .drop(columns=["Inventory", "SOLD YEAR"], errors="ignore")
+            .dropna(axis=1, how="all"))
     st.markdown(f"**VINs in this booking: {len(cars)}**")
     if cars.empty:
         st.caption("No VINs in the China VINs sheet for this booking.")
