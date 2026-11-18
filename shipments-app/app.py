@@ -210,7 +210,9 @@ def read_vins(xls):
     out = out[~out["Status"].str.contains("Cancelled|Not Shipped", case=False, regex=True)]
     out = out.assign(_has_booking=out["Booking #"] != "")
     out = out.sort_values("_has_booking", ascending=False).drop_duplicates("VIN")
-    return out.drop(columns="_has_booking").reset_index(drop=True)
+    full = df.loc[out.index]                      # every column of the sheet, same rows
+    out = out.drop(columns="_has_booking")
+    return out.reset_index(drop=True), full.reset_index(drop=True)
 
 
 @st.cache_data(max_entries=2, show_spinner="Loading shipments…")
@@ -219,9 +221,11 @@ def load_data(slot_key: str):
     xls = pd.ExcelFile(io.BytesIO(raw))
     china = read_sheet(xls, "China Shipments", ["Shipping Line.1", "Shipping Line"])
     f550 = read_sheet(xls, "F-550 Shipments", ["SL"])
-    vins = read_vins(xls)
+    vins, vins_full = read_vins(xls)
+    china_raw = pd.read_excel(xls, sheet_name=_sheet(xls, "China Shipments"))
+    f550_raw = pd.read_excel(xls, sheet_name=_sheet(xls, "F-550 Shipments"))
     loaded_at = dt.datetime.now(TZ)
-    return china, f550, vins, loaded_at
+    return china, f550, vins, vins_full, china_raw, f550_raw, loaded_at
 
 
 # ---------------------------------------------------------------- styling
@@ -255,7 +259,7 @@ def nb(df):
 
 # ---------------------------------------------------------------- page
 slot = last_refresh_slot()
-china, f550, vins, loaded_at = load_data(slot.isoformat())
+china, f550, vins, vins_full, china_raw, f550_raw, loaded_at = load_data(slot.isoformat())
 
 st.title("China & F-550 Shipments")
 st.markdown(f'<p class="sub">Last refresh: <b>{loaded_at:%d/%m/%Y, %H:%M}</b></p>', unsafe_allow_html=True)
@@ -263,7 +267,38 @@ st.markdown(f'<p class="sub">Last refresh: <b>{loaded_at:%d/%m/%Y, %H:%M}</b></p
 tab_china, tab_f550, tab_vins = st.tabs(["China Shipments", "F-550 Shipments", "China VINs"])
 
 
-def render(df: pd.DataFrame, key: str):
+def drill_down(key: str, table: pd.DataFrame, raw: pd.DataFrame, vins_full=None):
+    """Pick one booking: its shipment lines, every sheet column, and (China) its VINs."""
+    st.subheader("Open a shipment")
+    opts = sorted(b for b in table["Booking #"].unique() if b)
+    if not opts:
+        return
+    pick = st.selectbox("Booking #", opts, index=None, key=f"{key}-open",
+                        placeholder="Pick a booking number to see its details and VINs")
+    if not pick:
+        return
+
+    lines = table[table["Booking #"] == pick]
+    st.markdown(f"**Booking {pick}** · {int(lines['Cars'].sum())} cars · "
+                f"{', '.join(sorted(set(lines['Status'])))}")
+    st.dataframe(lines.drop(columns=["Year"]), hide_index=True, width="stretch")
+
+    sheet_rows = raw[raw["Booking#"].map(txt) == pick].dropna(axis=1, how="all")
+    with st.expander("Everything in the sheet for this booking", expanded=False):
+        st.dataframe(sheet_rows, hide_index=True, width="stretch")
+
+    if vins_full is None:
+        st.info("F-550 VINs are not linked to a booking number yet, so they are not shown here.")
+        return
+    cars = vins_full[vins_full["Booking#"].map(txt) == pick].dropna(axis=1, how="all")
+    st.markdown(f"**VINs in this booking: {len(cars)}**")
+    if cars.empty:
+        st.caption("No VINs in the China VINs sheet for this booking.")
+    else:
+        st.dataframe(cars, hide_index=True, width="stretch", height=420)
+
+
+def render(df: pd.DataFrame, key: str, raw: pd.DataFrame, vins_full=None):
     if df.empty:
         st.info("No shipments found in this sheet.")
         return
@@ -324,6 +359,8 @@ def render(df: pd.DataFrame, key: str):
             "Cars": st.column_config.NumberColumn(format="%d"),
         },
     )
+
+    drill_down(key, table, raw, vins_full)
 
 
 def render_vins(v: pd.DataFrame):
@@ -399,8 +436,8 @@ def render_vins(v: pd.DataFrame):
 
 
 with tab_china:
-    render(china, "china")
+    render(china, "china", china_raw, vins_full)
 with tab_f550:
-    render(f550, "f550")
+    render(f550, "f550", f550_raw, None)
 with tab_vins:
     render_vins(vins)
